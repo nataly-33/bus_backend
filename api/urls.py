@@ -7,7 +7,13 @@ urlpatterns = [
     path('lineas/cercanas/', views.lineas_cercanas),
     path('lineas-ruta/<int:linea_ruta_id>/puntos/', views.puntos_ruta),
 
-    # Microbuses activos (pantalla pasajero)
+    # Paradas (stops) — para mostrar en el mapa de búsqueda
+    path('paradas/', views.lista_paradas),
+
+    # Búsqueda de ruta óptima (Dijkstra)
+    path('buscar-ruta/', views.buscar_ruta),
+
+    # Microbuses activos
     path('posiciones/activos/', views.microbuses_activos),
 
     # Conductores
@@ -20,6 +26,5 @@ urlpatterns = [
     # Recorridos y GPS
     path('recorridos/iniciar/', views.iniciar_recorrido),
     path('posiciones/', views.enviar_posicion),
-    path('recorridos/<int:recorrido_id>/finalizar/',
-         views.finalizar_recorrido),
+    path('recorridos/<int:recorrido_id>/finalizar/', views.finalizar_recorrido),
 ]

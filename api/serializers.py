@@ -1,31 +1,35 @@
 from rest_framework import serializers
 from .models import (
-    Linea, LineaRuta, Punto, Conductor, Microbus, Recorrido, PosicionGPS
+    Linea, LineaRuta, Punto, LineaPunto,
+    Conductor, Microbus, Recorrido, PosicionGPS,
 )
 
 
 class LineaSerializer(serializers.ModelSerializer):
+    # Expone 'nombre' y 'color' para que Flutter no cambie su Linea.fromJson()
+    nombre = serializers.CharField(source='nombre_linea', read_only=True)
+    color  = serializers.CharField(source='color_linea', read_only=True)
+    # id_ruta=1 → Salida → Flutter "ida" ; id_ruta=2 → Retorno → Flutter "vuelta"
     ruta_ida_id    = serializers.SerializerMethodField()
     ruta_vuelta_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Linea
-        fields = ['id', 'codigo', 'nombre', 'color',
-                  'ruta_ida_id', 'ruta_vuelta_id']
+        fields = ['id', 'codigo', 'nombre', 'color', 'ruta_ida_id', 'ruta_vuelta_id']
 
     def get_ruta_ida_id(self, obj):
-        ruta = obj.rutas.filter(sentido='ida').first()
+        ruta = obj.rutas.filter(id_ruta=1).first()
         return ruta.id if ruta else None
 
     def get_ruta_vuelta_id(self, obj):
-        ruta = obj.rutas.filter(sentido='vuelta').first()
+        ruta = obj.rutas.filter(id_ruta=2).first()
         return ruta.id if ruta else None
 
 
 class PuntoSerializer(serializers.ModelSerializer):
     class Meta:
         model = Punto
-        fields = ['id', 'orden', 'latitud', 'longitud', 'descripcion']
+        fields = ['id', 'latitud', 'longitud', 'descripcion', 'stop']
 
 
 class LineaRutaSerializer(serializers.ModelSerializer):
