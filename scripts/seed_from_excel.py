@@ -209,4 +209,5 @@ def seed_from_excel(path=EXCEL_PATH):
     print(f"  {PuntoTrasbordo.objects.count()} trasbordos posibles")
 
 
-seed_from_excel()
+if __name__ == '__main__':
+    seed_from_excel()

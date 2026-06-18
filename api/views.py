@@ -49,9 +49,14 @@ def lista_lineas(request):
 
 @api_view(['GET'])
 def lista_paradas(request):
-    """Todos los Punto Stop='S' para mostrar en el mapa de búsqueda de ruta."""
+    """Stops que pertenecen a al menos una ruta real (LineaPunto)."""
+    en_ruta = (
+        set(LineaPunto.objects.values_list('punto_id',      flat=True)) |
+        set(LineaPunto.objects.values_list('punto_dest_id', flat=True))
+    )
     paradas = list(
-        Punto.objects.filter(stop='S').values('id', 'latitud', 'longitud', 'descripcion')
+        Punto.objects.filter(stop='S', id__in=en_ruta)
+        .values('id', 'latitud', 'longitud', 'descripcion')
     )
     return Response(paradas)
 
@@ -115,10 +120,10 @@ def lineas_cercanas(request):
 def buscar_ruta(request):
     """
     Body: { origen_lat, origen_lng, destino_lat, destino_lng }
-    Snap a paradas (Stop='S') más cercanas. Dijkstra sobre grafo (punto_id, linea_ruta_id).
-    Aristas de ruta: tiempo en minutos (haversine / 20 km/h).
-    Aristas de trasbordo: PuntoTrasbordo.penalizacion_min (siempre 5).
-    Devuelve hasta 5 rutas ordenadas por tiempo_total_min.
+    Carga el grafo primero, snap SOLO a paradas conectadas al grafo.
+    Si no hay PuntoTrasbordo, genera trasbordos geográficos automáticos
+    entre paradas de distintas líneas a ≤ 400 m (caminata).
+    Dijkstra sobre nodo = (punto_id, linea_ruta_id).
     """
     try:
         origen_lat  = float(request.data.get('origen_lat'))
@@ -128,15 +133,7 @@ def buscar_ruta(request):
     except (TypeError, ValueError):
         return Response({'error': 'Parámetros inválidos'}, status=400)
 
-    origen_stop  = _stop_mas_cercano(origen_lat, origen_lng)
-    destino_stop = _stop_mas_cercano(destino_lat, destino_lng)
-
-    if not origen_stop or not destino_stop:
-        return Response({'error': 'No hay paradas disponibles'}, status=404)
-    if origen_stop.id == destino_stop.id:
-        return Response({'error': 'Origen y destino son la misma parada'}, status=400)
-
-    # Cargar grafo completo en memoria (solo campos necesarios)
+    # Cargar grafo primero para saber qué paradas están conectadas
     edges_ruta = list(
         LineaPunto.objects
         .select_related('linea_ruta__linea')
@@ -144,13 +141,16 @@ def buscar_ruta(request):
               'orden', 'linea_ruta__id', 'linea_ruta__linea__codigo',
               'linea_ruta__linea__color_linea')
     )
+    if not edges_ruta:
+        return Response({'error': 'No hay rutas configuradas'}, status=404)
+
     edges_tr = list(
         PuntoTrasbordo.objects
         .only('punto_id', 'linea_ruta_origen_id', 'linea_ruta_destino_id',
               'penalizacion_min')
     )
 
-    linea_info = {}  # linea_ruta_id → {nombre, color}
+    linea_info = {}
     for lp in edges_ruta:
         if lp.linea_ruta_id not in linea_info:
             linea_info[lp.linea_ruta_id] = {
@@ -158,21 +158,67 @@ def buscar_ruta(request):
                 'color':  lp.linea_ruta.linea.color_linea,
             }
 
-    # Una sola query para desc + coords
     _puntos_all  = list(Punto.objects.only('id', 'latitud', 'longitud', 'descripcion'))
     punto_desc   = {p.id: (p.descripcion or f'Punto {p.id}') for p in _puntos_all}
     punto_coords = {p.id: (float(p.latitud), float(p.longitud)) for p in _puntos_all}
+
+    # Secuencia completa de puntos por linea_ruta (incluye intermedios no-stop)
+    # Para reconstruir polylines ricas sin depender del path de Dijkstra
+    _lr_segs = defaultdict(list)
+    for lp in edges_ruta:
+        _lr_segs[lp.linea_ruta_id].append((lp.orden, lp.punto_id, lp.punto_dest_id))
+
+    lr_route_pts = {}  # lr_id → [punto_id, ...] en orden de recorrido
+    lr_pid_idx   = {}  # (lr_id, punto_id) → índice en lr_route_pts[lr_id]
+
+    for lr_id, segs in _lr_segs.items():
+        segs.sort(key=lambda x: x[0])
+        seen, pts = set(), []
+        for (_ord, pid, _pdid) in segs:
+            if pid not in seen:
+                seen.add(pid)
+                pts.append(pid)
+        last_pdid = segs[-1][2]
+        if last_pdid not in seen:
+            pts.append(last_pdid)
+        lr_route_pts[lr_id] = pts
+        for idx, pid in enumerate(pts):
+            lr_pid_idx[(lr_id, pid)] = idx
+
+    # Paradas que tienen aristas salientes (fuentes) vs cualquier stop en el grafo
+    source_ids = {lp.punto_id for lp in edges_ruta}
+    graph_ids  = source_ids | {lp.punto_dest_id for lp in edges_ruta}
+
+    stops_source = [p for p in _puntos_all if p.id in source_ids and p.stop == 'S']
+    stops_graph  = [p for p in _puntos_all if p.id in graph_ids  and p.stop == 'S']
+
+    def _snap(lat, lng, candidates):
+        if not candidates:
+            return None
+        return min(candidates, key=lambda p: _metros(lat, lng, float(p.latitud), float(p.longitud)))
+
+    # Origen debe ser fuente (tiene aristas salientes); destino puede ser terminus
+    origen_stop  = _snap(origen_lat,  origen_lng,  stops_source)
+    destino_stop = _snap(destino_lat, destino_lng, stops_graph)
+
+    if not origen_stop or not destino_stop:
+        return Response({'error': 'No hay paradas disponibles'}, status=404)
+    if origen_stop.id == destino_stop.id:
+        return Response({'error': 'Origen y destino son la misma parada'}, status=400)
 
     # Construir grafo: nodo = (punto_id, linea_ruta_id)
     graph = defaultdict(list)
     edge_cost_map = {}
 
+    # stop_lr[punto_id] = {linea_ruta_id, ...}  — para start_nodes y trasbordos geo
+    stop_lr = defaultdict(set)
     for lp in edges_ruta:
         src  = (lp.punto_id, lp.linea_ruta_id)
         dst  = (lp.punto_dest_id, lp.linea_ruta_id)
         cost = float(lp.tiempo)
         graph[src].append((dst, cost))
         edge_cost_map[(src, dst)] = cost
+        stop_lr[lp.punto_id].add(lp.linea_ruta_id)
 
     for tr in edges_tr:
         src  = (tr.punto_id, tr.linea_ruta_origen_id)
@@ -181,10 +227,12 @@ def buscar_ruta(request):
         graph[src].append((dst, cost))
         edge_cost_map[(src, dst)] = cost
 
+    # Trasbordos solo por PuntoTrasbordo oficial del Excel (sin geo-transfers)
+
     origin_id = origen_stop.id
     dest_id   = destino_stop.id
 
-    start_nodes = {(origin_id, lp.linea_ruta_id) for lp in edges_ruta if lp.punto_id == origin_id}
+    start_nodes = {(origin_id, lr_id) for lr_id in stop_lr.get(origin_id, set())}
     goal_lr_ids = {lp.linea_ruta_id for lp in edges_ruta
                    if lp.punto_id == dest_id or lp.punto_dest_id == dest_id}
     goal_nodes = {(dest_id, lr_id) for lr_id in goal_lr_ids}
@@ -236,11 +284,22 @@ def buscar_ruta(request):
             seg_cost = sum(edge_cost_map.get((path[k], path[k + 1]), 0.0) for k in range(i, j - 1))
             if linea['nombre'] not in lineas_usadas:
                 lineas_usadas.append(linea['nombre'])
-            seg_puntos = [
-                {'lat': punto_coords[path[k][0]][0], 'lng': punto_coords[path[k][0]][1]}
-                for k in range(i, j)
-                if path[k][0] in punto_coords
-            ]
+            # Usar la secuencia completa de la ruta (incluye puntos intermedios)
+            start_pid = path[i][0]
+            s_idx = lr_pid_idx.get((lr_id, start_pid))
+            e_idx = lr_pid_idx.get((lr_id, last_pid))
+            if s_idx is not None and e_idx is not None and s_idx <= e_idx:
+                seg_puntos = [
+                    {'lat': punto_coords[pid][0], 'lng': punto_coords[pid][1]}
+                    for pid in lr_route_pts[lr_id][s_idx:e_idx + 1]
+                    if pid in punto_coords
+                ]
+            else:
+                seg_puntos = [
+                    {'lat': punto_coords[path[k][0]][0], 'lng': punto_coords[path[k][0]][1]}
+                    for k in range(i, j)
+                    if path[k][0] in punto_coords
+                ]
             pasos.append({
                 'tipo':       'ruta',
                 'linea':      linea['nombre'],
@@ -250,13 +309,17 @@ def buscar_ruta(request):
                 'tiempo_min': round(seg_cost, 1),
                 'puntos':     seg_puntos,
             })
-            if j < len(path) and path[j][0] == last_pid and path[j][1] != lr_id:
+            if j < len(path) and path[j][1] != lr_id:
                 next_lr   = path[j][1]
+                next_pid  = path[j][0]
                 next_info = linea_info.get(next_lr, {'nombre': '?', 'color': '#000000'})
                 tr_cost   = edge_cost_map.get((path[j - 1], path[j]), 5.0)
+                en_desc   = punto_desc.get(last_pid, str(last_pid))
+                if next_pid != last_pid:
+                    en_desc += f' → {punto_desc.get(next_pid, str(next_pid))}'
                 pasos.append({
                     'tipo':            'transbordo',
-                    'en_desc':         punto_desc.get(last_pid, str(last_pid)),
+                    'en_desc':         en_desc,
                     'de_linea':        linea['nombre'],
                     'a_linea':         next_info['nombre'],
                     'penalizacion_min': tr_cost,
@@ -304,7 +367,7 @@ def buscar_ruta(request):
         if not found:
             continue
         linea = linea_info.get(lr_id, {'nombre': '?', 'color': '#000000'})
-        key   = (tuple([linea['nombre']]), 0)
+        key   = ((linea['nombre'],), 0)
         if any((tuple(r['lineas']), r['trasbordos']) == key for r in rutas):
             continue
         rutas.append({
@@ -325,7 +388,7 @@ def buscar_ruta(request):
         })
 
     rutas.sort(key=lambda r: r['tiempo_total_min'])
-    return Response(rutas[:5])
+    return Response(rutas[:6])
 
 
 # ── MICROBUSES ACTIVOS ────────────────────────────────────────────────────────
