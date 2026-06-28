@@ -2,8 +2,9 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.utils import timezone
 import math
-import heapq
 from collections import defaultdict
+
+from .graph import k_rutas_optimas
 
 from .models import (
     Linea, LineaPunto, Punto, PuntoTrasbordo,
@@ -50,10 +51,15 @@ def lista_lineas(request):
 @api_view(['GET'])
 def lista_paradas(request):
     """Stops que pertenecen a al menos una ruta real (LineaPunto)."""
-    en_ruta = (
-        set(LineaPunto.objects.values_list('punto_id',      flat=True)) |
-        set(LineaPunto.objects.values_list('punto_dest_id', flat=True))
+    lp_qs = list(
+        LineaPunto.objects.all()
+        .only('punto_id', 'punto_dest_id')
     )
+    en_ruta = set()
+    for lp in lp_qs:
+        en_ruta.add(lp.punto_id)
+        en_ruta.add(lp.punto_dest_id)
+
     paradas = list(
         Punto.objects.filter(stop='S', id__in=en_ruta)
         .values('id', 'latitud', 'longitud', 'descripcion')
@@ -120,10 +126,9 @@ def lineas_cercanas(request):
 def buscar_ruta(request):
     """
     Body: { origen_lat, origen_lng, destino_lat, destino_lng }
-    Carga el grafo primero, snap SOLO a paradas conectadas al grafo.
-    Si no hay PuntoTrasbordo, genera trasbordos geográficos automáticos
-    entre paradas de distintas líneas a ≤ 400 m (caminata).
-    Dijkstra sobre nodo = (punto_id, linea_ruta_id).
+    Construye el grafo desde LineaPunto + PuntoTrasbordo oficial.
+    Ejecuta Yen's K-shortest paths (k=7) sobre nodo = (punto_id, linea_ruta_id).
+    Devuelve hasta 6 rutas reales ordenadas por tiempo_total_min.
     """
     try:
         origen_lat  = float(request.data.get('origen_lat'))
@@ -156,9 +161,10 @@ def buscar_ruta(request):
             linea_info[lp.linea_ruta_id] = {
                 'nombre': lp.linea_ruta.linea.codigo.strip(),
                 'color':  lp.linea_ruta.linea.color_linea,
+                'id_ruta': lp.linea_ruta.id_ruta,
             }
 
-    _puntos_all  = list(Punto.objects.only('id', 'latitud', 'longitud', 'descripcion'))
+    _puntos_all  = list(Punto.objects.only('id', 'latitud', 'longitud', 'descripcion', 'stop'))
     punto_desc   = {p.id: (p.descripcion or f'Punto {p.id}') for p in _puntos_all}
     punto_coords = {p.id: (float(p.latitud), float(p.longitud)) for p in _puntos_all}
 
@@ -240,34 +246,6 @@ def buscar_ruta(request):
     if not start_nodes or not goal_nodes:
         return Response([])
 
-    # ── Dijkstra ──────────────────────────────────────────────────────────────
-    def _run_dijkstra():
-        dist = {}
-        prev = {}
-        pq   = []
-        for node in start_nodes:
-            dist[node] = 0.0
-            heapq.heappush(pq, (0.0, node))
-
-        while pq:
-            cost, node = heapq.heappop(pq)
-            if cost > dist.get(node, float('inf')):
-                continue
-            if node in goal_nodes:
-                path, cur = [], node
-                while cur is not None:
-                    path.append(cur)
-                    cur = prev.get(cur)
-                path.reverse()
-                return cost, path
-            for neighbor, ecost in graph.get(node, []):
-                new_cost = cost + ecost
-                if new_cost < dist.get(neighbor, float('inf')):
-                    dist[neighbor] = new_cost
-                    prev[neighbor] = node
-                    heapq.heappush(pq, (new_cost, neighbor))
-        return None
-
     # ── Reconstruir pasos desde el path ───────────────────────────────────────
     def _path_to_ruta(total_cost, path):
         pasos = []
@@ -304,6 +282,7 @@ def buscar_ruta(request):
                 'tipo':       'ruta',
                 'linea':      linea['nombre'],
                 'color':      linea['color'],
+                'id_ruta':    linea['id_ruta'],
                 'desde_desc': punto_desc.get(punto_id, str(punto_id)),
                 'hasta_desc': punto_desc.get(last_pid,  str(last_pid)),
                 'tiempo_min': round(seg_cost, 1),
@@ -335,58 +314,8 @@ def buscar_ruta(request):
             'pasos':            pasos,
         }
 
-    rutas = []
-    result = _run_dijkstra()
-    if result:
-        rutas.append(_path_to_ruta(*result))
-
-    # Rutas directas adicionales (un solo linea_ruta, sin trasbordos)
-    lr_edges = defaultdict(dict)
-    for lp in edges_ruta:
-        lr_edges[lp.linea_ruta_id][lp.punto_id] = (lp.punto_dest_id, float(lp.tiempo))
-
-    for lr_id, e_dict in lr_edges.items():
-        if origin_id not in e_dict:
-            continue
-        cur, total_t, visited, found = origin_id, 0.0, set(), False
-        waypoints = []
-        if origin_id in punto_coords:
-            lat, lng = punto_coords[origin_id]
-            waypoints.append({'lat': lat, 'lng': lng})
-        while cur in e_dict and cur not in visited:
-            visited.add(cur)
-            nxt, t = e_dict[cur]
-            total_t += t
-            cur = nxt
-            if cur in punto_coords:
-                lat, lng = punto_coords[cur]
-                waypoints.append({'lat': lat, 'lng': lng})
-            if cur == dest_id:
-                found = True
-                break
-        if not found:
-            continue
-        linea = linea_info.get(lr_id, {'nombre': '?', 'color': '#000000'})
-        key   = ((linea['nombre'],), 0)
-        if any((tuple(r['lineas']), r['trasbordos']) == key for r in rutas):
-            continue
-        rutas.append({
-            'tiempo_total_min': round(total_t, 1),
-            'trasbordos':       0,
-            'lineas':           [linea['nombre']],
-            'origen_desc':      punto_desc.get(origin_id, str(origin_id)),
-            'destino_desc':     punto_desc.get(dest_id,   str(dest_id)),
-            'pasos': [{
-                'tipo':       'ruta',
-                'linea':      linea['nombre'],
-                'color':      linea['color'],
-                'desde_desc': punto_desc.get(origin_id, str(origin_id)),
-                'hasta_desc': punto_desc.get(dest_id,   str(dest_id)),
-                'tiempo_min': round(total_t, 1),
-                'puntos':     waypoints,
-            }],
-        })
-
+    raw_rutas = k_rutas_optimas(graph, start_nodes, goal_nodes, k=7)
+    rutas = [_path_to_ruta(cost, path) for cost, path in raw_rutas]
     rutas.sort(key=lambda r: r['tiempo_total_min'])
     return Response(rutas[:6])
 
