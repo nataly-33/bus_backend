@@ -332,7 +332,7 @@ def microbuses_activos(request):
 
     resultado = []
     for rec in recorridos:
-        ultima = rec.posiciones.filter(activo=True).first()
+        ultima = rec.posiciones.filter(activo=True).order_by('-timestamp').first()
         if ultima:
             resultado.append({
                 'recorrido_id': rec.id,
@@ -361,11 +361,11 @@ def registrar_conductor(request):
 def login_conductor(request):
     email    = request.data.get('email')
     password = request.data.get('password')
-    try:
-        c = Conductor.objects.get(email=email, password=password)
+    
+    c = Conductor.objects.filter(email__iexact=email, password=password).first()
+    if c:
         return Response({'conductor_id': c.id, 'nombre': c.nombre, 'ci': c.ci})
-    except Conductor.DoesNotExist:
-        return Response({'error': 'Credenciales incorrectas'}, status=401)
+    return Response({'error': 'Credenciales incorrectas'}, status=401)
 
 
 # ── MICROBUSES ────────────────────────────────────────────────────────────────
